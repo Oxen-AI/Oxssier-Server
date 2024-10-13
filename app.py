@@ -1,3 +1,9 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
+import uvicorn
+import logging
 import os
 import json
 import requests
@@ -6,10 +12,24 @@ from openai import OpenAI
 import pandas as pd
 import argparse
 import time
-
+from urllib.parse import unquote
 from oxen import RemoteRepo
 from oxen import Repo
 from oxen.auth import config_auth
+
+app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.DEBUG)
+
 
 namespace='ox'
 repo_name = 'Investors'
@@ -50,7 +70,7 @@ def get_firecrawl_response(company_url):
     response = requests.post(url, headers=headers, data=json.dumps(data))
 
     response_json = response.json()
-    print("Firecrawl response: ", response_json)
+    logging.debug("Firecrawl response: ", response_json)
     extracted_content = response_json['data']['extract']
     company_name = extracted_content['company_name']
     company_description = extracted_content['company_description']
@@ -88,13 +108,13 @@ def get_portfolio_links(vc_url):
     # convert http:// to https://
     company_links_list = [link.replace('http://', 'https://') for link in company_links_list]
     
-    print(company_links_list)
+    logging.debug(company_links_list)
     return company_links_list
 
 def portfolio_file_from_name(vc_name):
     name = vc_name.split(' ')
     filename = '_'.join(name)
-    return os.path.join(repo_name, f"{filename}_Portfolio.parquet")
+    return os.path.join(repo_name, f"{filename}_Portfolio.jsonl")
 
 def crawl_company_links(company_links_list, n=5):
     company_urls = []
@@ -105,19 +125,19 @@ def crawl_company_links(company_links_list, n=5):
     if n == -1:
         n = len(company_links_list)
         
-    print("Crawling ", n, " companies")
+    logging.debug(f"Crawling {n} companies")
     
     for company_link in company_links_list[:n]:
-        print(f"Crawling: {company_link}")
+        logging.debug(f"Crawling: {company_link}")
         try:
             company_name, company_description = get_firecrawl_response(company_link)
-            print(f"Company name: {company_name}")
-            print(f"Company description: {company_description}")
+            logging.debug(f"Company name: {company_name}")
+            logging.debug(f"Company description: {company_description}")
             company_names.append(company_name)
             company_descriptions.append(company_description)
             company_urls.append(company_link)
         except Exception as e:
-            print(f"Error crawling: {e}")
+            logging.debug(f"Error crawling: {e}")
             company_names.append("Error")
             company_descriptions.append(f"Error crawling {company_link}: {e}")
             company_urls.append(company_link)
@@ -125,11 +145,11 @@ def crawl_company_links(company_links_list, n=5):
 
 def get_or_crawl_companies(vc_url, vc_name, num_companies, force=False):
     portfolio_file = portfolio_file_from_name(vc_name)
-    print(f"Portfolio file: {portfolio_file}")
+    logging.debug(f"Portfolio file: {portfolio_file}")
     if not force and os.path.exists(portfolio_file):
-        print(f"Data for {vc_name} already exists. Use --force to overwrite.")
+        logging.debug(f"Data for {vc_name} already exists. Use --force to overwrite.")
         # read the file
-        df = pd.read_csv(portfolio_file)
+        df = pd.read_json(portfolio_file, lines=True)
         return df
     
     company_links_list = get_portfolio_links(vc_url)
@@ -140,8 +160,7 @@ def get_or_crawl_companies(vc_url, vc_name, num_companies, force=False):
         'company_description': company_descriptions
     })
 
-
-    df.to_parquet(portfolio_file, index=False)
+    df.to_json(portfolio_file, orient='records', lines=True)
     return df
 
 def push_to_oxen(vc_name):
@@ -169,7 +188,7 @@ def kick_off_evaluation(vc_name):
     resource = resource.replace(repo_name, 'main')
 
     url = f"https://hub.oxen.ai/api/repos/{namespace}/{repo_name}/evaluations/{resource}"
-    print("Evaluation URL: ", url)
+    logging.debug(f"Evaluation URL: {url}")
 
     headers = {
         "Authorization": f"Bearer {oxen_api_key}",
@@ -206,31 +225,130 @@ Are these two companies competitive with each other? Respond with one word only,
 
     response = requests.post(url, headers=headers, json=data)
     response_json = response.json()
-    print("Evaluation response: ", response_json)
+    logging.debug(f"Evaluation response: {response_json}")
     
     if response.status_code == 200:
-        print(f"Evaluation for {vc_name} portfolio kicked off successfully.")
+        logging.debug(f"Evaluation for {vc_name} portfolio kicked off successfully.")
     else:
-        print(f"Failed to kick off evaluation for {vc_name} portfolio. Status code: {response.status_code}")
-        print(f"Response: {response.text}")
+        logging.debug(f"Failed to kick off evaluation for {vc_name} portfolio. Status code: {response.status_code}")
+        logging.debug(f"Response: {response.text}")
 
 def crawl_vc_portfolio(vc_url, vc_name, num_companies, force=False):
-    df = get_or_crawl_companies(vc_url, vc_name, num_companies, force)
-    print(df)
-    push_to_oxen(vc_name)
-    print("Waiting 5 seconds for data to be indexed")
-    time.sleep(5)
-    kick_off_evaluation(vc_name)
+    if force:
+        df = get_or_crawl_companies(vc_url, vc_name, num_companies, force)
+        logging.debug(df)
+        push_to_oxen(vc_name)
+        logging.debug("Waiting 5 seconds for data to be indexed")
+        time.sleep(5)
+        kick_off_evaluation(vc_name)
+    else:
+        df = get_or_crawl_companies(vc_url, vc_name, num_companies, force)
+        logging.debug(df)
 
-def main():
-    parser = argparse.ArgumentParser(description="Crawl VC portfolio companies")
-    parser.add_argument("vc_url", help="URL of the VC portfolio page")
-    parser.add_argument("vc_name", help="Name of the VC firm")
-    parser.add_argument("-n", "--num_companies", type=int, default=5, help="Number of companies to crawl (default: 5)")
-    parser.add_argument("-f", "--force", action="store_true", help="Force crawl even if data exists")
-    args = parser.parse_args()
 
-    crawl_vc_portfolio(args.vc_url, args.vc_name, args.num_companies, args.force)
+# In-memory storage for demonstration purposes
+data_store = []
 
-if __name__ == "__main__":
-    main()
+def list_results(vc_name):
+    portfolio_file = portfolio_file_from_name(vc_name)
+    file_path = portfolio_file.replace(repo_name, f'api-results-branch-{vc_name}')
+    url = f"https://hub.oxen.ai/api/repos/{namespace}/{repo_name}/file/{file_path}"
+    logging.debug(f"File path: {file_path}")
+    logging.debug(f"URL: {url}")
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        data = response.text
+        
+        logging.debug(data)
+        
+        # Parse the line-delimited JSON
+        results = []
+        for line in data.splitlines():
+            company_data = json.loads(line)
+            logging.debug(company_data)
+            results.append({
+                "url": company_data.get("url", ""),
+                "name": company_data.get("company_name", ""),
+                "description": company_data.get("company_description", ""),
+                "competitive": company_data.get("industry_prediction", False)
+            })
+        
+        return results
+    except requests.RequestException as e:
+        logging.error(f"Error fetching results for {vc_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error fetching results")
+
+def is_competitive(company_a, company_b):
+    return False
+
+def crawl_portfolio_website(row):
+    name = row['name']
+    url = row['url']
+    logging.debug(url)
+    return [
+        {
+            "name": name,
+            "description": "Description of Company A"
+        }
+    ]
+
+def crawl_vc_website(url):
+    return [
+        {
+            "name": "Company A",
+            "url": "https://www.company-a.com"
+        },
+        {
+            "name": "Company B",
+            "url": "https://www.company-b.com"
+        }
+    ]
+
+class CrawlRequest(BaseModel):
+    url: str
+    prompt: str
+    name: str
+    numCompanies: int
+
+class CompanyData(BaseModel):
+    url: str
+    name: str
+    description: str
+    competitive: bool
+
+@app.post('/api/crawl', status_code=201)
+async def add_data(vc_crawl_request: CrawlRequest):
+    try:
+        vc_crawl_request.name = vc_crawl_request.name.replace(" ", "_")
+        logging.debug(f"Received data: {vc_crawl_request}")
+        
+        url = vc_crawl_request.url
+        data = crawl_vc_website(url)
+        for row in data:
+            data_store.append(crawl_portfolio_website(row))
+
+        data_store.append(vc_crawl_request.dict())
+        
+        crawl_vc_portfolio(url, vc_crawl_request.name, vc_crawl_request.numCompanies, force=True)
+        logging.debug("Waiting 5 seconds for data to be indexed")
+        time.sleep(5)
+        
+        return {"message": "Data added successfully", "data": vc_crawl_request}
+    except Exception as e:
+        logging.error(f"Error processing request: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get('/api/results/{vc_name}', response_model=List[CompanyData])
+async def get_data(vc_name: str):
+    # url decode vc_name
+    vc_name = unquote(vc_name)
+    logging.debug(f"Getting data for {vc_name}")
+    vc_name = vc_name.replace(" ", "_")
+    response = list_results(vc_name)
+    return response
+
+if __name__ == '__main__':
+    uvicorn.run(app, host="0.0.0.0", port=8000)
